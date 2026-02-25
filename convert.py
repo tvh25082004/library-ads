@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import requests
 import psycopg2
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -277,16 +278,54 @@ class Pix2TexEngine:
         return self._model(img)
 
 
+class TextOCREngine:
+    """EasyOCR - OCR văn bản tiếng Việt và tiếng Anh, giữ nguyên dấu."""
+
+    VIETNAMESE_CHARS = re.compile(
+        r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩ'
+        r'òóọỏõôồốộổỗơờớợởỡ'
+        r'ùúụủũưừứựửữỳýỵỷỹđ'
+        r'ÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨ'
+        r'ÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠ'
+        r'ÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]'
+    )
+
+    def __init__(self):
+        import easyocr
+        logger.info("Đang tải model EasyOCR (Việt + Anh)...")
+        self._reader = easyocr.Reader(['vi', 'en'], gpu=False)
+        logger.info("EasyOCR đã sẵn sàng.")
+
+    def predict(self, image_path: str) -> str:
+        results = self._reader.readtext(image_path, detail=0, paragraph=True)
+        return "\n".join(results) if results else ""
+
+    def predict_from_image(self, img: Image.Image) -> str:
+        img_array = np.array(img)
+        results = self._reader.readtext(img_array, detail=0, paragraph=True)
+        return "\n".join(results) if results else ""
+
+    @classmethod
+    def has_vietnamese(cls, text: str) -> bool:
+        return bool(cls.VIETNAMESE_CHARS.search(text))
+
+
 class ImageToLatexConverter:
     """
-    Dual-engine OCR:
-    1. TexTeller (primary) - 80M training pairs, chính xác cao
-    2. pix2tex (fallback) - nếu TexTeller fail
-    + Post-processing dọn dẹp LaTeX artifacts
+    Hybrid OCR engine:
+    1. EasyOCR      - văn bản tiếng Việt + tiếng Anh (giữ dấu)
+    2. TexTeller    - công thức toán học → LaTeX
+    3. pix2tex      - fallback công thức toán
+
+    Chiến lược routing:
+    - Phát hiện tiếng Việt → ưu tiên EasyOCR
+    - Không có tiếng Việt  → thử TexTeller/pix2tex cho LaTeX
+    - Tất cả fail          → fallback về EasyOCR text
     """
 
     def __init__(self):
-        self._primary = TexTellerEngine()
+        self._text_engine = TextOCREngine()
+        self._math_engine = TexTellerEngine()
         self._fallback = None
 
     def _load_fallback(self):
@@ -297,27 +336,72 @@ class ImageToLatexConverter:
     def convert(self, source: str) -> str:
         local_path = ImageLoader.resolve_path(source)
 
-        latex = self._try_engine(self._primary, local_path, source)
-        if latex:
-            return LatexPostProcessor.clean(latex)
+        text_result = self._try_text_ocr(local_path, source)
+        has_vietnamese = text_result and TextOCREngine.has_vietnamese(text_result)
+        has_text = text_result and len(text_result.strip()) > 3
 
-        raw_img = ImageLoader.load_image(source)
-        preprocessed = ImagePreprocessor.standard(raw_img.copy())
-        latex = self._try_with_preprocessed(self._primary, preprocessed)
+        if has_vietnamese:
+            logger.info(f"  Phát hiện tiếng Việt → EasyOCR: {source}")
+            return text_result
+
+        math_result = self._try_math_ocr(local_path, source)
+        if math_result:
+            return LatexPostProcessor.clean(math_result)
+
+        if has_text:
+            return text_result
+
+        raise RuntimeError(f"Không thể OCR ảnh: {source}")
+
+    def _try_text_ocr(self, local_path: str, source: str) -> str | None:
+        try:
+            result = self._text_engine.predict(local_path)
+            if result and result.strip():
+                return result
+        except Exception as e:
+            logger.debug(f"  EasyOCR lỗi: {e}")
+
+        try:
+            raw_img = ImageLoader.load_image(source)
+            preprocessed = ImagePreprocessor.standard(raw_img.copy())
+            result = self._text_engine.predict_from_image(preprocessed)
+            if result and result.strip():
+                return result
+        except Exception as e:
+            logger.debug(f"  EasyOCR preprocessed lỗi: {e}")
+
+        return None
+
+    def _try_math_ocr(self, local_path: str, source: str) -> str | None:
+        latex = self._try_engine(self._math_engine, local_path, source)
         if latex:
-            return LatexPostProcessor.clean(latex)
+            return latex
+
+        try:
+            raw_img = ImageLoader.load_image(source)
+            preprocessed = ImagePreprocessor.standard(raw_img.copy())
+            latex = self._try_with_preprocessed(self._math_engine, preprocessed)
+            if latex:
+                return latex
+        except Exception:
+            pass
 
         logger.info(f"  TexTeller fail -> fallback pix2tex: {source}")
         fallback = self._load_fallback()
         latex = self._try_engine(fallback, local_path, source)
         if latex:
-            return LatexPostProcessor.clean(latex)
+            return latex
 
-        latex = self._try_with_preprocessed(fallback, preprocessed)
-        if latex:
-            return LatexPostProcessor.clean(latex)
+        try:
+            raw_img = ImageLoader.load_image(source)
+            preprocessed = ImagePreprocessor.standard(raw_img.copy())
+            latex = self._try_with_preprocessed(fallback, preprocessed)
+            if latex:
+                return latex
+        except Exception:
+            pass
 
-        raise RuntimeError(f"Không thể OCR ảnh: {source}")
+        return None
 
     @staticmethod
     def _try_engine(engine, path: str, source: str) -> str | None:
