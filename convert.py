@@ -6,14 +6,12 @@ import hashlib
 import tempfile
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import psycopg2
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-from pix2tex.cli import LatexOCR
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -24,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 CACHE_DIR = Path(__file__).parent / ".img_cache"
+TEMP_DIR = Path(__file__).parent / ".tmp_preprocess"
 
 
 class DBConfig:
@@ -102,7 +101,6 @@ class ImageLoader:
             return cache_path
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
         resp = requests.get(url, timeout=cls.DOWNLOAD_TIMEOUT, stream=True)
         resp.raise_for_status()
 
@@ -119,7 +117,6 @@ class ImageLoader:
 
     @classmethod
     def download_batch(cls, urls: list[str]) -> dict[str, Path]:
-        """Download nhiều URL song song, trả về dict {url: local_path}."""
         results = {}
         urls_to_download = []
 
@@ -156,25 +153,27 @@ class ImageLoader:
         return results
 
     @classmethod
-    def load(cls, source: str) -> Image.Image:
+    def resolve_path(cls, source: str) -> str:
         if cls.is_url(source):
-            local_path = cls.download_single(source)
-        else:
-            local_path = Path(source)
+            return str(cls.download_single(source))
+        return source
 
-        if not local_path.exists():
+    @classmethod
+    def load_image(cls, source: str) -> Image.Image:
+        path = cls.resolve_path(source)
+        if not Path(path).exists():
             raise FileNotFoundError(f"Không tìm thấy ảnh: {source}")
-
-        img = Image.open(local_path)
-        if img.mode == "RGBA":
+        img = Image.open(path)
+        if img.mode in ("RGBA", "P"):
             bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            bg.paste(img, mask=img.split()[3] if "A" in img.getbands() else None)
             return bg
         return img.convert("RGB")
 
 
 class ImagePreprocessor:
-    """Tiền xử lý ảnh để tăng độ chính xác OCR."""
 
     @staticmethod
     def enhance(img: Image.Image) -> Image.Image:
@@ -188,7 +187,7 @@ class ImagePreprocessor:
         return img.filter(ImageFilter.MedianFilter(size=3))
 
     @staticmethod
-    def to_grayscale_binary(img: Image.Image, threshold: int = 180) -> Image.Image:
+    def to_binary(img: Image.Image, threshold: int = 180) -> Image.Image:
         gray = img.convert("L")
         return gray.point(lambda x: 255 if x > threshold else 0, "L").convert("RGB")
 
@@ -211,50 +210,134 @@ class ImagePreprocessor:
         return img
 
     @classmethod
-    def aggressive(cls, img: Image.Image) -> Image.Image:
-        img = cls.optimal_resize(img)
-        img = cls.to_grayscale_binary(img)
-        img = ImageEnhance.Contrast(img).enhance(2.0)
-        img = ImageEnhance.Sharpness(img).enhance(3.0)
-        return img
+    def save_preprocessed(cls, img: Image.Image, suffix: str = "") -> str:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = TEMP_DIR / f"pre_{id(img)}_{suffix}.png"
+        img.save(tmp)
+        return str(tmp)
+
+
+class LatexPostProcessor:
+    """Dọn dẹp LaTeX output từ OCR."""
+
+    ARTIFACTS = [
+        (re.compile(r'^\\(scriptstyle|textstyle)\s*'), ''),
+        (re.compile(r'\\;\s*\\;\s*\\;\s*\\;\s*\\;'), ' '),
+        (re.compile(r'\s{2,}'), ' '),
+    ]
+
+    @classmethod
+    def clean(cls, latex: str) -> str:
+        if not latex:
+            return latex
+        result = latex.strip()
+        for pattern, replacement in cls.ARTIFACTS:
+            result = pattern.sub(replacement, result)
+        return result.strip()
+
+
+class TexTellerEngine:
+    """TexTeller - train trên 80M cặp dữ liệu, chính xác hơn pix2tex."""
+
+    def __init__(self):
+        from texteller import load_model, load_tokenizer, img2latex as _img2latex
+        logger.info("Đang tải model TexTeller...")
+        self._model = load_model(use_onnx=False)
+        self._tokenizer = load_tokenizer()
+        self._img2latex = _img2latex
+        logger.info("TexTeller đã sẵn sàng.")
+
+    def predict(self, image_path: str) -> str:
+        results = self._img2latex(self._model, self._tokenizer, [image_path])
+        return results[0] if results else ""
+
+    def predict_from_image(self, img: Image.Image) -> str:
+        tmp_path = ImagePreprocessor.save_preprocessed(img, "texteller")
+        try:
+            return self.predict(tmp_path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+
+class Pix2TexEngine:
+    """pix2tex (LaTeX-OCR) - fallback engine."""
+
+    def __init__(self):
+        from pix2tex.cli import LatexOCR
+        logger.info("Đang tải model pix2tex (fallback)...")
+        self._model = LatexOCR()
+        self._model.args.temperature = 0.05
+        logger.info("pix2tex đã sẵn sàng.")
+
+    def predict(self, image_path: str) -> str:
+        img = Image.open(image_path).convert("RGB")
+        return self._model(img)
+
+    def predict_from_image(self, img: Image.Image) -> str:
+        return self._model(img)
 
 
 class ImageToLatexConverter:
     """
-    pix2tex (LaTeX-OCR) ViT.
-    - temperature thấp -> kết quả ổn định
-    - Fallback: standard -> aggressive -> raw
+    Dual-engine OCR:
+    1. TexTeller (primary) - 80M training pairs, chính xác cao
+    2. pix2tex (fallback) - nếu TexTeller fail
+    + Post-processing dọn dẹp LaTeX artifacts
     """
 
     def __init__(self):
-        logger.info("Đang tải model LaTeX-OCR (pix2tex ViT)...")
-        self._model = LatexOCR()
-        self._model.args.temperature = 0.05
-        logger.info("Model đã sẵn sàng (temperature=0.05).")
+        self._primary = TexTellerEngine()
+        self._fallback = None
 
-    def _predict(self, img: Image.Image) -> str:
-        return self._model(img)
+    def _load_fallback(self):
+        if self._fallback is None:
+            self._fallback = Pix2TexEngine()
+        return self._fallback
 
     def convert(self, source: str) -> str:
-        raw_img = ImageLoader.load(source)
+        local_path = ImageLoader.resolve_path(source)
 
-        strategies = [
-            ("standard", ImagePreprocessor.standard),
-            ("aggressive", ImagePreprocessor.aggressive),
-            ("raw", lambda img: img),
-        ]
+        latex = self._try_engine(self._primary, local_path, source)
+        if latex:
+            return LatexPostProcessor.clean(latex)
 
-        for name, preprocess_fn in strategies:
-            try:
-                img = preprocess_fn(raw_img.copy())
-                latex = self._predict(img)
-                if latex and latex.strip():
-                    return latex
-            except Exception as e:
-                logger.debug(f"  [{name}] lỗi: {e}")
-                continue
+        raw_img = ImageLoader.load_image(source)
+        preprocessed = ImagePreprocessor.standard(raw_img.copy())
+        latex = self._try_with_preprocessed(self._primary, preprocessed)
+        if latex:
+            return LatexPostProcessor.clean(latex)
+
+        logger.info(f"  TexTeller fail -> fallback pix2tex: {source}")
+        fallback = self._load_fallback()
+        latex = self._try_engine(fallback, local_path, source)
+        if latex:
+            return LatexPostProcessor.clean(latex)
+
+        latex = self._try_with_preprocessed(fallback, preprocessed)
+        if latex:
+            return LatexPostProcessor.clean(latex)
 
         raise RuntimeError(f"Không thể OCR ảnh: {source}")
+
+    @staticmethod
+    def _try_engine(engine, path: str, source: str) -> str | None:
+        try:
+            result = engine.predict(path)
+            if result and result.strip():
+                return result
+        except Exception as e:
+            logger.debug(f"  Engine {engine.__class__.__name__} lỗi: {e}")
+        return None
+
+    @staticmethod
+    def _try_with_preprocessed(engine, img: Image.Image) -> str | None:
+        try:
+            result = engine.predict_from_image(img)
+            if result and result.strip():
+                return result
+        except Exception as e:
+            logger.debug(f"  Preprocessed fail: {e}")
+        return None
 
 
 class App:
@@ -298,6 +381,11 @@ class App:
 
     def close(self):
         self._conn.close()
+        TEMP_DIR_PATH = Path(TEMP_DIR)
+        if TEMP_DIR_PATH.exists():
+            for f in TEMP_DIR_PATH.iterdir():
+                f.unlink(missing_ok=True)
+            TEMP_DIR_PATH.rmdir()
 
 
 def main():

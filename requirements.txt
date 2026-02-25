@@ -1,3 +1,4 @@
+texteller>=1.0.0
 pix2tex>=0.1.4
 psycopg2-binary>=2.9.9
 Pillow>=10.0.0
