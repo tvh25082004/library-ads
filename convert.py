@@ -1,12 +1,20 @@
 import os
 import sys
+import re
 import logging
+import hashlib
+import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 import psycopg2
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pix2tex.cli import LatexOCR
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,6 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+CACHE_DIR = Path(__file__).parent / ".img_cache"
 
 
 class DBConfig:
@@ -66,25 +75,106 @@ class DocumentRepository:
         return doc_id
 
 
-class ImagePreprocessor:
-    """Tiền xử lý ảnh để tăng độ chính xác OCR, xử lý cả ảnh xấu/mờ/nhiễu."""
+class ImageLoader:
+    """Tải ảnh từ local path hoặc URL, cache URL đã download."""
 
-    @staticmethod
-    def validate(path: Path) -> bool:
-        if not path.exists():
-            raise FileNotFoundError(f"Không tìm thấy ảnh: {path}")
-        if path.suffix.lower() not in SUPPORTED_FORMATS:
-            raise ValueError(f"Định dạng không hỗ trợ: {path.suffix}")
-        return True
+    URL_PATTERN = re.compile(r'^https?://')
+    DOWNLOAD_TIMEOUT = 30
+    MAX_DOWNLOAD_WORKERS = 8
 
-    @staticmethod
-    def load(path: Path) -> Image.Image:
-        img = Image.open(path)
+    @classmethod
+    def is_url(cls, source: str) -> bool:
+        return bool(cls.URL_PATTERN.match(source))
+
+    @classmethod
+    def _url_to_cache_path(cls, url: str) -> Path:
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        parsed = urlparse(url)
+        ext = Path(parsed.path).suffix.lower()
+        if ext not in SUPPORTED_FORMATS:
+            ext = ".png"
+        return CACHE_DIR / f"{url_hash}{ext}"
+
+    @classmethod
+    def download_single(cls, url: str) -> Path:
+        cache_path = cls._url_to_cache_path(url)
+        if cache_path.exists():
+            return cache_path
+
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        resp = requests.get(url, timeout=cls.DOWNLOAD_TIMEOUT, stream=True)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "")
+        if not content_type.startswith("image/"):
+            img = Image.open(BytesIO(resp.content))
+            img.save(cache_path)
+        else:
+            with open(cache_path, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    f.write(chunk)
+
+        return cache_path
+
+    @classmethod
+    def download_batch(cls, urls: list[str]) -> dict[str, Path]:
+        """Download nhiều URL song song, trả về dict {url: local_path}."""
+        results = {}
+        urls_to_download = []
+
+        for url in urls:
+            cache_path = cls._url_to_cache_path(url)
+            if cache_path.exists():
+                results[url] = cache_path
+            else:
+                urls_to_download.append(url)
+
+        if not urls_to_download:
+            return results
+
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        workers = min(cls.MAX_DOWNLOAD_WORKERS, len(urls_to_download))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(cls.download_single, url): url
+                for url in urls_to_download
+            }
+            for future in tqdm(
+                as_completed(future_map),
+                total=len(urls_to_download),
+                desc="Download ảnh",
+                unit="file",
+            ):
+                url = future_map[future]
+                try:
+                    results[url] = future.result()
+                except Exception as e:
+                    logger.error(f"[DOWNLOAD FAIL] {url} | {e}")
+
+        return results
+
+    @classmethod
+    def load(cls, source: str) -> Image.Image:
+        if cls.is_url(source):
+            local_path = cls.download_single(source)
+        else:
+            local_path = Path(source)
+
+        if not local_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy ảnh: {source}")
+
+        img = Image.open(local_path)
         if img.mode == "RGBA":
             bg = Image.new("RGB", img.size, (255, 255, 255))
             bg.paste(img, mask=img.split()[3])
             return bg
         return img.convert("RGB")
+
+
+class ImagePreprocessor:
+    """Tiền xử lý ảnh để tăng độ chính xác OCR."""
 
     @staticmethod
     def enhance(img: Image.Image) -> Image.Image:
@@ -114,19 +204,14 @@ class ImagePreprocessor:
         return img
 
     @classmethod
-    def process(cls, path: Path) -> Image.Image:
-        cls.validate(path)
-        img = cls.load(path)
+    def standard(cls, img: Image.Image) -> Image.Image:
         img = cls.optimal_resize(img)
         img = cls.enhance(img)
         img = cls.denoise(img)
         return img
 
     @classmethod
-    def process_aggressive(cls, path: Path) -> Image.Image:
-        """Cho ảnh chất lượng rất xấu: binarize + enhance mạnh hơn."""
-        cls.validate(path)
-        img = cls.load(path)
+    def aggressive(cls, img: Image.Image) -> Image.Image:
         img = cls.optimal_resize(img)
         img = cls.to_grayscale_binary(img)
         img = ImageEnhance.Contrast(img).enhance(2.0)
@@ -136,9 +221,9 @@ class ImagePreprocessor:
 
 class ImageToLatexConverter:
     """
-    Sử dụng pix2tex (LaTeX-OCR) với cấu hình tối ưu cho độ chính xác cao.
-    - temperature thấp -> kết quả ổn định, ít random
-    - Retry với nhiều mức tiền xử lý nếu kết quả trống/lỗi
+    pix2tex (LaTeX-OCR) ViT.
+    - temperature thấp -> kết quả ổn định
+    - Fallback: standard -> aggressive -> raw
     """
 
     def __init__(self):
@@ -150,32 +235,26 @@ class ImageToLatexConverter:
     def _predict(self, img: Image.Image) -> str:
         return self._model(img)
 
-    def convert(self, image_path: str) -> str:
-        path = Path(image_path)
+    def convert(self, source: str) -> str:
+        raw_img = ImageLoader.load(source)
 
         strategies = [
-            ("standard", ImagePreprocessor.process),
-            ("aggressive", ImagePreprocessor.process_aggressive),
-            ("raw", lambda p: ImagePreprocessor.load(p)),
+            ("standard", ImagePreprocessor.standard),
+            ("aggressive", ImagePreprocessor.aggressive),
+            ("raw", lambda img: img),
         ]
 
-        results = []
         for name, preprocess_fn in strategies:
             try:
-                img = preprocess_fn(path)
+                img = preprocess_fn(raw_img.copy())
                 latex = self._predict(img)
-                if latex and len(latex.strip()) > 0:
-                    results.append((name, latex))
-                    logger.debug(f"  [{name}] -> {latex[:60]}")
-                    break
+                if latex and latex.strip():
+                    return latex
             except Exception as e:
                 logger.debug(f"  [{name}] lỗi: {e}")
                 continue
 
-        if not results:
-            raise RuntimeError(f"Không thể OCR ảnh: {image_path}")
-
-        return results[0][1]
+        raise RuntimeError(f"Không thể OCR ảnh: {source}")
 
 
 class App:
@@ -184,10 +263,11 @@ class App:
         self._repo = DocumentRepository(self._conn)
         self._converter = ImageToLatexConverter()
 
-    def insert_images(self, paths: list[str]):
-        for p in paths:
-            doc_id = self._repo.insert_image(p)
-            logger.info(f"Đã thêm ảnh: id={doc_id}, path={p}")
+    def insert_images(self, sources: list[str]):
+        for s in sources:
+            doc_id = self._repo.insert_image(s)
+            tag = "URL" if ImageLoader.is_url(s) else "LOCAL"
+            logger.info(f"[{tag}] Đã thêm: id={doc_id}, source={s}")
 
     def convert_all(self):
         rows = self._repo.fetch_unconverted()
@@ -196,18 +276,23 @@ class App:
             return
 
         total = len(rows)
-        success = 0
         logger.info(f"Tìm thấy {total} ảnh cần convert.")
 
-        for doc_id, image_path in rows:
+        urls = [src for _, src in rows if ImageLoader.is_url(src)]
+        if urls:
+            logger.info(f"Đang download {len(urls)} ảnh từ URL...")
+            ImageLoader.download_batch(urls)
+
+        success = 0
+        for doc_id, source in tqdm(rows, desc="Convert OCR", unit="ảnh"):
             try:
-                latex = self._converter.convert(image_path)
+                latex = self._converter.convert(source)
                 self._repo.update_latex(doc_id, latex)
                 preview = latex[:80] + "..." if len(latex) > 80 else latex
-                logger.info(f"[OK] id={doc_id} | {image_path} -> {preview}")
+                tqdm.write(f"  [OK] id={doc_id} | {source} -> {preview}")
                 success += 1
             except Exception as e:
-                logger.error(f"[FAIL] id={doc_id} | {image_path} | {e}")
+                tqdm.write(f"  [FAIL] id={doc_id} | {source} | {e}")
 
         logger.info(f"Kết quả: {success}/{total} ảnh convert thành công.")
 
@@ -217,14 +302,14 @@ class App:
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "insert":
-        image_paths = sys.argv[2:]
-        if not image_paths:
-            print("Sử dụng: python convert.py insert <path1> <path2> ...")
+        sources = sys.argv[2:]
+        if not sources:
+            print("Sử dụng: python convert.py insert <path_or_url> ...")
             sys.exit(1)
 
         app = App()
         try:
-            app.insert_images(image_paths)
+            app.insert_images(sources)
         finally:
             app.close()
     else:

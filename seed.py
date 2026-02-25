@@ -1,5 +1,4 @@
 import os
-import random
 from pathlib import Path
 
 import psycopg2
@@ -17,6 +16,12 @@ EQUATIONS = [
     (r"$\int_{0}^{\infty} e^{-x^{2}} dx = \frac{\sqrt{\pi}}{2}$", "integral"),
     (r"$\sum_{n=1}^{\infty} \frac{1}{n^{2}} = \frac{\pi^{2}}{6}$", "series"),
     (r"$\frac{\partial^{2} u}{\partial t^{2}} = c^{2} \nabla^{2} u$", "wave_eq"),
+]
+
+SAMPLE_URLS = [
+    "https://latex.codecogs.com/png.latex?%5Cdpi%7B150%7D%20E%20%3D%20mc%5E%7B2%7D",
+    "https://latex.codecogs.com/png.latex?%5Cdpi%7B150%7D%20%5Cfrac%7B%5Cpartial%20f%7D%7B%5Cpartial%20x%7D%20%2B%20%5Cfrac%7B%5Cpartial%20f%7D%7B%5Cpartial%20y%7D%20%3D%200",
+    "https://latex.codecogs.com/png.latex?%5Cdpi%7B150%7D%20%5Cint_%7Ba%7D%5E%7Bb%7D%20f(x)%20dx%20%3D%20F(b)%20-%20F(a)",
 ]
 
 DB_DSN = {
@@ -71,7 +76,7 @@ def generate_images():
     return paths
 
 
-def insert_to_db(paths):
+def insert_to_db(local_paths, url_paths):
     conn = psycopg2.connect(**DB_DSN)
     cur = conn.cursor()
 
@@ -82,14 +87,16 @@ def insert_to_db(paths):
         conn.close()
         return
 
-    for p in paths:
-        cur.execute("INSERT INTO document (images) VALUES (%s)", (p,))
+    all_sources = local_paths + url_paths
+    for s in all_sources:
+        cur.execute("INSERT INTO document (images) VALUES (%s)", (s,))
     conn.commit()
-    print(f"[SEED] Đã thêm {len(paths)} ảnh mẫu vào database.")
+
+    print(f"[SEED] Đã thêm {len(local_paths)} ảnh local + {len(url_paths)} URL vào database.")
     cur.close()
     conn.close()
 
 
 if __name__ == "__main__":
-    paths = generate_images()
-    insert_to_db(paths)
+    local_paths = generate_images()
+    insert_to_db(local_paths, SAMPLE_URLS)
