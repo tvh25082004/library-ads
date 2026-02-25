@@ -10,13 +10,11 @@ log()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err()  { echo -e "${RED}[ERROR]${NC} $1"; }
 
-log "=== Bước 1: Pull PostgreSQL image ==="
+log "=== Bước 1/4: Pull & khởi động PostgreSQL ==="
 docker compose pull
-
-log "=== Bước 2: Khởi động PostgreSQL container ==="
 docker compose up -d
 
-log "=== Bước 3: Chờ database sẵn sàng ==="
+log "=== Chờ database sẵn sàng ==="
 RETRIES=0
 MAX_RETRIES=30
 until docker compose exec -T postgres pg_isready -U admin -d docdb > /dev/null 2>&1; do
@@ -30,17 +28,16 @@ until docker compose exec -T postgres pg_isready -U admin -d docdb > /dev/null 2
 done
 log "Database đã sẵn sàng!"
 
-log "=== Bước 4: Cài đặt Python dependencies ==="
+log "=== Bước 2/4: Cài đặt Python dependencies ==="
 pip install -r requirements.txt -q
 
-log "=== Bước 5: Tạo dữ liệu mẫu (ảnh công thức toán) ==="
+log "=== Bước 3/4: Load ảnh từ samples/ & Convert OCR ==="
 python3 seed.py
-
-log "=== Bước 6: Chạy convert images -> LaTeX ==="
 python3 convert.py
 
-log "=== Bước 7: Hiển thị kết quả ==="
-docker compose exec -T postgres psql -U admin -d docdb -c \
-    "SELECT id, images, latex FROM document;"
+log "=== Bước 4/4: Export database → Excel ==="
+python3 convert.py export
 
-log "=== Hoàn tất! ==="
+log "========================================="
+log "  HOÀN TẤT! File kết quả: document_database.xlsx"
+log "========================================="

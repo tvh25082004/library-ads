@@ -1,9 +1,13 @@
-.PHONY: run setup seed convert insert stop clean status view
+.PHONY: run setup load convert export insert stop clean status view
 
-run: setup seed convert result
+run: setup load convert export
+	@echo ""
+	@echo "========================================="
+	@echo "  HOÀN TẤT! File kết quả: document_database.xlsx"
+	@echo "========================================="
 
 setup:
-	@echo ">>> Pull & khởi động PostgreSQL..."
+	@echo ">>> [1/4] Pull & khởi động PostgreSQL..."
 	docker compose pull
 	docker compose up -d
 	@echo ">>> Chờ database sẵn sàng..."
@@ -13,13 +17,17 @@ setup:
 	@echo ">>> Database sẵn sàng!"
 	pip install -r requirements.txt -q
 
-seed:
-	@echo ">>> Tạo dữ liệu mẫu (ảnh công thức toán)..."
+load:
+	@echo ">>> [2/4] Load ảnh từ samples/ vào database..."
 	python3 seed.py
 
 convert:
-	@echo ">>> Convert images -> LaTeX..."
+	@echo ">>> [3/4] Convert images → OCR (Việt + Anh + LaTeX)..."
 	python3 convert.py
+
+export:
+	@echo ">>> [4/4] Export database → Excel..."
+	python3 convert.py export
 
 insert:
 	@echo ">>> Thêm ảnh vào database..."
@@ -47,6 +55,7 @@ stop:
 
 clean:
 	docker compose down -v
+	rm -f document_database.xlsx
 
 status:
 	docker compose ps

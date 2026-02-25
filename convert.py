@@ -472,18 +472,89 @@ class App:
             TEMP_DIR_PATH.rmdir()
 
 
+def export_to_excel(output_path: str = "document_database.xlsx"):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    conn = psycopg2.connect(**DBConfig.dsn())
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, images, latex, created_at, updated_at "
+        "FROM document ORDER BY id"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        logger.info("Database trống, không có gì để export.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Documents"
+
+    headers = ["ID", "Ảnh (đường dẫn)", "Kết quả OCR", "Ngày tạo", "Ngày cập nhật"]
+    header_font = Font(name="Times New Roman", bold=True, size=12, color="FFFFFF")
+    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin_border
+
+    body_font = Font(name="Times New Roman", size=11)
+    body_align = Alignment(vertical="top", wrap_text=True)
+
+    for row_idx, (doc_id, images, latex, created, updated) in enumerate(rows, 2):
+        filename = Path(images).name if images and not images.startswith("http") else images
+        values = [doc_id, filename, latex or "(chưa convert)", str(created), str(updated)]
+        for col_idx, val in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.font = body_font
+            cell.alignment = body_align
+            cell.border = thin_border
+
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 25
+    ws.column_dimensions["C"].width = 80
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 20
+
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = "A2"
+
+    wb.save(output_path)
+    logger.info(f"Đã export {len(rows)} bản ghi → {output_path}")
+
+
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "insert":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    if cmd == "insert":
         sources = sys.argv[2:]
         if not sources:
             print("Sử dụng: python convert.py insert <path_or_url> ...")
             sys.exit(1)
-
         app = App()
         try:
             app.insert_images(sources)
         finally:
             app.close()
+
+    elif cmd == "export":
+        out = sys.argv[2] if len(sys.argv) > 2 else "document_database.xlsx"
+        export_to_excel(out)
+
     else:
         app = App()
         try:
